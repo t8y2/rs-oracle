@@ -412,6 +412,7 @@ pub mod ccap_index {
     pub const TTC4: usize = 40;
     pub const LOB2: usize = 42;
     pub const TTC5: usize = 44;
+    pub const FEATURE_BACKPORT2: usize = 45;
     pub const VECTOR_FEATURES: usize = 52;
     pub const MAX: usize = 53;
 }
@@ -444,6 +445,7 @@ pub mod ccap_value {
 
     pub const CTB_IMPLICIT_POOL: u8 = 0x08;
     pub const CTB_OAUTH_MSG_ON_ERR: u8 = 0x10;
+    pub const END_USER_SEC_CTX_PIGGYBACK: u8 = 0x01;
 
     pub const END_OF_CALL_STATUS: u8 = 0x01;
     pub const IND_RCD: u8 = 0x08;

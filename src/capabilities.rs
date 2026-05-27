@@ -146,6 +146,8 @@ impl Capabilities {
             | PIPELINING_BREAK
             | SESSIONLESS_TXNS;
 
+        self.compile_caps[FEATURE_BACKPORT2] = END_USER_SEC_CTX_PIGGYBACK;
+
         self.compile_caps[VECTOR_FEATURES] = VECTOR_FEATURE_BINARY | VECTOR_FEATURE_SPARSE;
     }
 
