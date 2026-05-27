@@ -111,6 +111,14 @@ impl ReadBuffer {
     /// The first byte gives the length. If the length is TNS_LONG_LENGTH_INDICATOR (254),
     /// then chunks are read and concatenated until a chunk with length 0 is found.
     pub fn read_raw_bytes_chunked(&mut self) -> Result<Vec<u8>> {
+        self.read_raw_bytes_chunked_ext(true)
+    }
+
+    /// Read a chunked byte sequence with configurable chunk size encoding.
+    ///
+    /// When `big_clr` is true, chunk sizes use TNS ub4 variable-length encoding.
+    /// When `big_clr` is false, chunk sizes are a single u8 byte (11g and below).
+    pub fn read_raw_bytes_chunked_ext(&mut self, big_clr: bool) -> Result<Vec<u8>> {
         let length = self.read_u8()?;
         if length != length::LONG_INDICATOR {
             // Simple case: read the specified number of bytes
@@ -119,7 +127,11 @@ impl ReadBuffer {
             // Chunked case: keep reading chunks until chunk size is 0
             let mut result = Vec::new();
             loop {
-                let chunk_size = self.read_ub4()? as usize;
+                let chunk_size = if big_clr {
+                    self.read_ub4()? as usize
+                } else {
+                    self.read_u8()? as usize
+                };
                 if chunk_size == 0 {
                     break;
                 }

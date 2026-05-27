@@ -123,3 +123,14 @@ impl RowStream {
         Ok(())
     }
 }
+
+impl Drop for RowStream {
+    fn drop(&mut self) {
+        // Clear local buffer and mark cursor as closed.
+        // The server-side cursor will be automatically cleaned up by Oracle
+        // when the next query is executed on this connection.
+        self.buffer.clear();
+        self.cursor_id = 0;
+        self.has_more = false;
+    }
+}

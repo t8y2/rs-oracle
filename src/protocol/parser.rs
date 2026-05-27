@@ -840,6 +840,26 @@ impl ProtocolParser {
 
         // Handle LOB columns specially - they have a different format
         if col.is_lob() {
+            // 10g (ttc_fv <= 5) does not support LOB prefetch.
+            // Without prefetch, the locator is returned as raw length-prefixed bytes
+            // instead of the {UB4 count, UB8 size, UB4 chunk, locator} prefetch format.
+            if caps.ttc_field_version <= ccap_value::FIELD_VERSION_10_2 {
+                let data = buf.read_bytes_with_length()?;
+                return match data {
+                    None => Ok(Value::Lob(LobValue::Null)),
+                    Some(bytes) if bytes.is_empty() => Ok(Value::Lob(LobValue::Empty)),
+                    Some(bytes) => {
+                        let locator = LobLocator::new(
+                            bytes::Bytes::from(bytes),
+                            0, // unknown size (can be fetched via LOB ops)
+                            0, // unknown chunk_size
+                            col.oracle_type,
+                            col.csfrm,
+                        );
+                        Ok(Value::Lob(LobValue::locator(locator)))
+                    }
+                };
+            }
             return self.parse_lob_value(buf, col);
         }
 
@@ -1724,7 +1744,7 @@ impl ProtocolParser {
         Ok(columns)
     }
 
-    pub(crate) fn parse_lob_read_response(&self, payload: Bytes, locator: &LobLocator) -> Result<LobData> {
+    pub(crate) fn parse_lob_read_response(&self, payload: Bytes, locator: &LobLocator, big_clr: bool) -> Result<LobData> {
         use crate::buffer::ReadBuffer;
 
         let mut buf = ReadBuffer::new(payload);
@@ -1742,7 +1762,7 @@ impl ProtocolParser {
                 // LobData message (14)
                 x if x == MessageType::LobData as u8 => {
                     // Read LOB data with length
-                    let data = buf.read_raw_bytes_chunked()?;
+                    let data = buf.read_raw_bytes_chunked_ext(big_clr)?;
                     lob_data = Some(data);
                 }
 

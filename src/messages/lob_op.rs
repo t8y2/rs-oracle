@@ -393,7 +393,10 @@ impl<'a> LobOpMessage<'a> {
         // Write data for write operations
         if let Some(data) = self.write_data {
             buf.write_u8(MessageType::LobData as u8)?;
-            buf.write_bytes_with_length(Some(data))?;
+            // 11g (FIELD_VERSION_11_2 = 6) and below use u8 chunk
+            // length prefixes; 12c+ uses ub4 (big_clr).
+            let big_clr = caps.ttc_field_version > crate::constants::ccap_value::FIELD_VERSION_11_2;
+            buf.write_bytes_with_length_ext(Some(data), big_clr)?;
         }
 
         // Write amount if needed

@@ -38,7 +38,8 @@ use crate::buffer::{ReadBuffer, WriteBuffer};
 use crate::capabilities::Capabilities;
 use crate::config::{Config, ServiceMethod};
 use crate::constants::{
-    ccap_value, BindDirection, FetchOrientation, FunctionCode, MessageType, MAX_VARCHAR_SQL,
+    ccap_value, BindDirection, DEFAULT_STREAM_FETCH_SIZE, FetchOrientation, FunctionCode,
+    MessageType, MAX_VARCHAR_SQL,
     OracleType, PacketType, PACKET_HEADER_SIZE,
 };
 use crate::cursor::{ScrollResult, ScrollableCursor};
@@ -1627,7 +1628,7 @@ impl Connection {
         self.ensure_ready().await?;
 
         // Promote oversized strings to CLOB binds
-        let (promoted_params, temp_lobs) = self.promote_params_if_needed(params).await?;
+        let (promoted_params, temp_lobs) = self.promote_params_if_needed(params, MAX_VARCHAR_SQL).await?;
         let has_promotion = !temp_lobs.is_empty();
         let params_to_use: &[Value] = if has_promotion { &promoted_params } else { params };
 
@@ -1734,7 +1735,7 @@ impl Connection {
     #[tracing::instrument(skip(self, params), fields(sql = %sql, params.len = params.len()))]
     pub async fn query(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         // Promote oversized strings to CLOB binds
-        let (promoted_params, temp_lobs) = self.promote_params_if_needed(params).await?;
+        let (promoted_params, temp_lobs) = self.promote_params_if_needed(params, MAX_VARCHAR_SQL).await?;
         let params_to_use: &[Value] = if temp_lobs.is_empty() { params } else { &promoted_params };
 
         // Use initial prefetch of 1000 rows. For narrow tables this reduces
@@ -1781,9 +1782,19 @@ impl Connection {
         fetch_size: u32,
     ) -> Result<crate::stream::RowStream> {
         let fetch_size = fetch_size.max(1);
+
+        // CLOB auto-promotion
+        let (promoted_params, temp_lobs) = self.promote_params_if_needed(params, MAX_VARCHAR_SQL).await?;
+        let params_to_use: &[Value] = if temp_lobs.is_empty() { params } else { &promoted_params };
+
         let result = self
-            .query_internal(sql, params, None, fetch_size, false)
-            .await?;
+            .query_internal(sql, params_to_use, None, fetch_size, false)
+            .await;
+
+        // Clean up temp LOBs
+        self.cleanup_temp_lobs(&temp_lobs).await;
+
+        let result = result?;
 
         Ok(crate::stream::RowStream::new(
             self.clone(),
@@ -1793,6 +1804,33 @@ impl Connection {
             result.has_more_rows,
             fetch_size,
         ))
+    }
+
+    /// Execute a query and return a streaming result set with default fetch size.
+    ///
+    /// Convenience wrapper around [`query_stream`](Self::query_stream) that uses
+    /// [`DEFAULT_STREAM_FETCH_SIZE`](crate::constants::DEFAULT_STREAM_FETCH_SIZE) (256 rows per batch).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use rust_oracle::Connection;
+    ///
+    /// # async fn example() -> rust_oracle::Result<()> {
+    /// let conn = Connection::connect("localhost:1521/FREEPDB1", "user", "pass").await?;
+    /// let mut stream = conn.query_stream_default("SELECT * FROM large_table", &[]).await?;
+    /// while let Some(row) = stream.next().await {
+    ///     println!("{:?}", row?.get_string(0));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn query_stream_default(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<crate::stream::RowStream> {
+        self.query_stream(sql, params, DEFAULT_STREAM_FETCH_SIZE).await
     }
 
 
@@ -2301,12 +2339,12 @@ impl Connection {
             });
         }
 
-        // CLOB auto-promotion: check each row for oversized strings
+        // CLOB auto-promotion per row
         let mut promoted_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         let mut all_temp_lobs: Vec<LobLocator> = Vec::new();
 
         for row in rows {
-            let (promoted_row, temp_lobs) = self.promote_params_if_needed(row).await?;
+            let (promoted_row, temp_lobs) = self.promote_params_if_needed(row, MAX_VARCHAR_SQL).await?;
             if !temp_lobs.is_empty() {
                 all_temp_lobs.extend(temp_lobs);
             }
@@ -3795,10 +3833,12 @@ impl Connection {
         }
 
         // Parse LOB data response (may span multiple packets — retry on underflow)
+        let big_clr = inner.capabilities.ttc_field_version
+            > crate::constants::ccap_value::FIELD_VERSION_11_2;
         let mut lob_response = response;
         loop {
             let payload = lob_response.slice(PACKET_HEADER_SIZE..);
-            match ProtocolParser.parse_lob_read_response(payload, locator) {
+            match ProtocolParser.parse_lob_read_response(payload, locator, big_clr) {
                 Ok(data) => return Ok(data),
                 Err(Error::BufferUnderflow { .. }) => {
                     lob_response = inner.receive_more_data(&lob_response).await?;
@@ -4159,14 +4199,45 @@ impl Connection {
 
     /// Check parameters and promote oversized strings to temporary CLOB binds.
     /// Returns promoted params and a list of temp LOBs to free after execution.
+    /// Detect whether a SQL statement is a PL/SQL anonymous block.
+    ///
+    /// Returns true if the trimmed, case-insensitive statement starts with
+    /// `BEGIN` or `DECLARE`.
+    #[allow(dead_code)]
+    fn is_plsql_context(sql: &str) -> bool {
+        let trimmed = sql.trim().to_uppercase();
+        trimmed.starts_with("BEGIN") || trimmed.starts_with("DECLARE")
+    }
+
     async fn promote_params_if_needed(
         &self,
         params: &[Value],
+        max_varchar: usize,
     ) -> Result<(Vec<Value>, Vec<LobLocator>)> {
+        // CLOB auto-promotion via CREATE_TEMP LOB does not work on 10g (FIELD_VERSION_10_2).
+        // 10g's LOB operation protocol is fundamentally incompatible — CREATE_TEMP LOB
+        // and LOB writes both kill the connection.
+        {
+            let inner = self.inner.lock().await;
+            if inner.capabilities.ttc_field_version <= crate::constants::ccap_value::FIELD_VERSION_10_2 {
+                // Check if any param actually needs promotion
+                for value in params {
+                    if let Value::String(s) = value {
+                        if s.len() > max_varchar {
+                            return Err(Error::Protocol(
+                                "CLOB auto-promotion is not supported on Oracle 10g. \
+                                 Values larger than the VARCHAR limit cannot be bound to CLOB columns.".into()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut needs_promotion = false;
         for value in params {
             if let Value::String(s) = value {
-                if s.len() > MAX_VARCHAR_SQL {
+                if s.len() > max_varchar {
                     needs_promotion = true;
                     break;
                 }
@@ -4180,7 +4251,7 @@ impl Connection {
         let mut temp_lobs = Vec::new();
         for value in params {
             if let Value::String(s) = value {
-                if s.len() > MAX_VARCHAR_SQL {
+                if s.len() > max_varchar {
                     let lob = self.create_temp_lob(OracleType::Clob).await?;
                     self.write_clob(&lob, 1, s).await?;
                     temp_lobs.push(lob.clone());
@@ -4885,6 +4956,25 @@ fn oracle_type_from_name(type_name: &str) -> crate::constants::OracleType {
         "XMLTYPE" => OracleType::Varchar, // Treat XMLType as string for now
         _ => OracleType::Varchar,         // Default to VARCHAR for unknown types
     }
+}
+
+#[test]
+fn test_is_plsql_context() {
+    // PL/SQL contexts
+    assert!(Connection::is_plsql_context("BEGIN INSERT INTO t VALUES (:1); END;"));
+    assert!(Connection::is_plsql_context("DECLARE v NUMBER; BEGIN NULL; END;"));
+    assert!(Connection::is_plsql_context("begin null; end;"));
+    assert!(Connection::is_plsql_context("  BEGIN ... END;"));
+    assert!(Connection::is_plsql_context("\t\n  DeClArE x INT; BEGIN NULL; END;"));
+
+    // SQL contexts (not PL/SQL)
+    assert!(!Connection::is_plsql_context("SELECT * FROM dual"));
+    assert!(!Connection::is_plsql_context("INSERT INTO t VALUES (1)"));
+    assert!(!Connection::is_plsql_context("UPDATE t SET x = 1"));
+    assert!(!Connection::is_plsql_context("DELETE FROM t"));
+    assert!(!Connection::is_plsql_context("CREATE TABLE t (x NUMBER)"));
+    assert!(!Connection::is_plsql_context(""));
+    assert!(!Connection::is_plsql_context("  "));
 }
 
 #[cfg(test)]

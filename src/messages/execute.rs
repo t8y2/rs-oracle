@@ -378,14 +378,11 @@ impl<'a> ExecuteMessage<'a> {
         buf.write_u8(0)?;
         buf.write_u8(0)?;
 
-        // Column defines
-        if stmt.requires_define() {
-            buf.write_u8(1)?;
-            buf.write_ub2(stmt.column_count() as u16)?; // PutUint(count, 2, true, true)
-        } else {
-            buf.write_u8(0)?;
-            buf.write_u8(0)?; // PutBytes(0, 0)
-        }
+        // Column defines: always 0 on 10g — explicit define metadata
+        // would use the 11g+ format (cont_flag etc.) which 10g doesn't understand.
+        // Let the server use the implicit column types from the parse phase instead.
+        buf.write_u8(0)?;
+        buf.write_u8(0)?; // PutBytes(0, 0)
 
         // TTCVersion >= 4: PutBytes(0, 0, 1)
         buf.write_u8(0)?;
@@ -553,6 +550,10 @@ impl<'a> ExecuteMessage<'a> {
             } else if self.has_bind_values() {
                 self.write_bind_params(buf, caps)?;
             }
+            // Note: column defines are NOT written on the 10g path.
+            // The 10g header declares the column count via its own mechanism,
+            // and the server uses implicit (parse-time) column types.
+            // Explicit column defines in the 11g+ format would confuse 10g.
             return Ok(());
         }
 

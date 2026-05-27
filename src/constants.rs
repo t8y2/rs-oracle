@@ -761,6 +761,13 @@ pub const MAX_UROWID_LENGTH: u32 = 5267;
 /// Strings exceeding this must use CLOB binding for CLOB target columns.
 pub const MAX_VARCHAR_SQL: usize = 4000;
 
+/// Maximum VARCHAR2 size in PL/SQL context (anonymous blocks).
+/// PL/SQL supports extended VARCHAR2 up to 32767 bytes.
+pub const MAX_PLSQL_VARCHAR: usize = 32767;
+
+/// Default number of rows to fetch per batch in streaming queries.
+pub const DEFAULT_STREAM_FETCH_SIZE: u32 = 256;
+
 /// Bind indicator flags
 #[allow(missing_docs)]
 pub mod bind_flags {
