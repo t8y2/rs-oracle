@@ -924,7 +924,7 @@ impl<'a> ExecuteMessage<'a> {
             for row in &self.batch_bind_values {
                 buf.write_u8(MessageType::RowData as u8)?;
                 for value in row {
-                    self.write_bind_value(buf, value)?;
+                    self.write_bind_value(buf, value, caps.use_big_clr_chunks)?;
                 }
             }
         }
@@ -987,7 +987,7 @@ impl<'a> ExecuteMessage<'a> {
         // Write bind values for the single row
         buf.write_u8(MessageType::RowData as u8)?;
         for value in params {
-            self.write_bind_value(buf, value)?;
+            self.write_bind_value(buf, value, caps.use_big_clr_chunks)?;
         }
 
         Ok(())
@@ -1058,7 +1058,7 @@ impl<'a> ExecuteMessage<'a> {
     }
 
     /// Write a single bind value
-    fn write_bind_value(&self, buf: &mut WriteBuffer, value: &Value) -> Result<()> {
+    fn write_bind_value(&self, buf: &mut WriteBuffer, value: &Value, big_clr: bool) -> Result<()> {
         use crate::types::{encode_binary_double, encode_oracle_number};
 
         match value {
@@ -1084,29 +1084,10 @@ impl<'a> ExecuteMessage<'a> {
                 buf.write_bytes(&encoded)?;
             }
             Value::String(s) => {
-                let bytes = s.as_bytes();
-                if bytes.is_empty() {
-                    buf.write_u8(0)?; // Empty string = NULL in Oracle
-                } else if bytes.len() <= 252 {
-                    buf.write_u8(bytes.len() as u8)?;
-                    buf.write_bytes(bytes)?;
-                } else {
-                    buf.write_u8(254)?; // Long form indicator
-                    buf.write_ub4(bytes.len() as u32)?;
-                    buf.write_bytes(bytes)?;
-                }
+                buf.write_bytes_with_length_ext(Some(s.as_bytes()), big_clr)?;
             }
             Value::Bytes(b) => {
-                if b.is_empty() {
-                    buf.write_u8(0)?;
-                } else if b.len() <= 252 {
-                    buf.write_u8(b.len() as u8)?;
-                    buf.write_bytes(b)?;
-                } else {
-                    buf.write_u8(254)?;
-                    buf.write_ub4(b.len() as u32)?;
-                    buf.write_bytes(b)?;
-                }
+                buf.write_bytes_with_length_ext(Some(b.as_slice()), big_clr)?;
             }
             Value::Boolean(b) => {
                 // Oracle Boolean encoding: escape char + value
@@ -1463,14 +1444,14 @@ impl<'a> ExecuteMessage<'a> {
             if !params.is_empty() {
                 buf.write_u8(MessageType::RowData as u8)?;
                 for value in params {
-                    self.write_bind_value(buf, value)?;
+                    self.write_bind_value(buf, value, caps.use_big_clr_chunks)?;
                 }
             }
         } else if self.has_bind_values() {
             for row in &self.batch_bind_values {
                 buf.write_u8(MessageType::RowData as u8)?;
                 for value in row {
-                    self.write_bind_value(buf, value)?;
+                    self.write_bind_value(buf, value, caps.use_big_clr_chunks)?;
                 }
             }
         }

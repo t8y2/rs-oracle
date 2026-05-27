@@ -130,16 +130,16 @@
 //! ### Batch Operations
 //!
 //! ```rust,no_run
-//! use rust_oracle::{Connection, BatchBuilder, Value};
+//! use rust_oracle::{Connection, Value};
 //!
 //! # async fn example(conn: Connection) -> rust_oracle::Result<()> {
-//! let batch = BatchBuilder::new("INSERT INTO users (id, name) VALUES (:1, :2)")
-//!     .add_row(vec![1.into(), "Alice".into()])
-//!     .add_row(vec![2.into(), "Bob".into()])
-//!     .add_row(vec![3.into(), "Charlie".into()])
-//!     .build();
+//! let rows = vec![
+//!     vec![Value::Integer(1), Value::String("Alice".into())],
+//!     vec![Value::Integer(2), Value::String("Bob".into())],
+//!     vec![Value::Integer(3), Value::String("Charlie".into())],
+//! ];
 //!
-//! let result = conn.execute_batch(&batch).await?;
+//! let result = conn.execute_batch("INSERT INTO users (id, name) VALUES (:1, :2)", &rows).await?;
 //! conn.commit().await?;
 //! # Ok(())
 //! # }

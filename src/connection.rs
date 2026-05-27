@@ -38,7 +38,7 @@ use crate::buffer::{ReadBuffer, WriteBuffer};
 use crate::capabilities::Capabilities;
 use crate::config::{Config, ServiceMethod};
 use crate::constants::{
-    ccap_value, BindDirection, FetchOrientation, FunctionCode, MessageType,
+    ccap_value, BindDirection, FetchOrientation, FunctionCode, MessageType, MAX_VARCHAR_SQL,
     OracleType, PacketType, PACKET_HEADER_SIZE,
 };
 use crate::cursor::{ScrollResult, ScrollableCursor};
@@ -55,7 +55,7 @@ use crate::row::{Row, Value};
 use crate::statement::{BindParam, ColumnInfo, Statement, StatementType};
 use crate::statement_cache::StatementCache;
 use crate::transport::{connect_tls, TlsConfig, TlsOracleStream};
-use crate::types::{LobData, LobLocator};
+use crate::types::{LobData, LobLocator, LobValue};
 
 /// Transaction isolation level.
 ///
@@ -1626,8 +1626,15 @@ impl Connection {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         self.ensure_ready().await?;
 
-        // Check statement cache for existing prepared statement
-        let (statement, from_cache) = {
+        // Promote oversized strings to CLOB binds
+        let (promoted_params, temp_lobs) = self.promote_params_if_needed(params).await?;
+        let has_promotion = !temp_lobs.is_empty();
+        let params_to_use: &[Value] = if has_promotion { &promoted_params } else { params };
+
+        // When promotion occurred, skip the statement cache because bind types changed.
+        let statement = if has_promotion {
+            Statement::new(sql)
+        } else {
             let cache_arc = {
                 let inner = self.inner.lock().await;
                 inner.statement_cache.clone()
@@ -1640,62 +1647,70 @@ impl Connection {
                         cursor_id = cached_stmt.cursor_id(),
                         "Using cached statement (execute)"
                     );
-                    (cached_stmt, true)
+                    cached_stmt
                 } else {
-                    (Statement::new(sql), false)
+                    Statement::new(sql)
                 }
             } else {
-                (Statement::new(sql), false)
+                Statement::new(sql)
             }
         };
+        let from_cache = statement.cursor_id() > 0;
 
         let result = match statement.statement_type() {
-            StatementType::Query => self.execute_query_with_params(&statement, params).await,
-            _ => self.execute_dml_with_params(&statement, params).await,
+            StatementType::Query => {
+                self.execute_query_with_params(&statement, params_to_use).await
+            }
+            _ => self.execute_dml_with_params(&statement, params_to_use).await,
         };
 
-        // Return statement to cache or cache it for the first time
-        match &result {
-            Ok(query_result) => {
-                let cache_arc = {
-                    let inner = self.inner.lock().await;
-                    inner.statement_cache.clone()
-                };
-                if let Some(cache) = cache_arc {
-                    let mut cache = cache.lock().await;
-                    let should_close_cursor = if statement.statement_type() == StatementType::Query
-                    {
-                        !query_result.has_more_rows
-                    } else {
-                        true // DML/DDL/PL-SQL: always close
-                    };
+        // Clean up temp LOBs regardless of success/failure
+        self.cleanup_temp_lobs(&temp_lobs).await;
 
-                    if from_cache {
-                        cache.return_statement(sql);
-                        if should_close_cursor {
-                            cache.mark_cursor_closed(sql);
-                        }
-                    } else if query_result.cursor_id > 0 && !statement.is_ddl() {
-                        let mut stmt_to_cache = statement.clone();
-                        stmt_to_cache.set_cursor_id(query_result.cursor_id);
-                        stmt_to_cache.set_executed(true);
-                        cache.put(sql.to_string(), stmt_to_cache);
-                        if should_close_cursor {
-                            cache.mark_cursor_closed(sql);
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                if from_cache {
+        // Return statement to cache or cache it for the first time (skip if promoted)
+        if !has_promotion {
+            match &result {
+                Ok(query_result) => {
                     let cache_arc = {
                         let inner = self.inner.lock().await;
                         inner.statement_cache.clone()
                     };
                     if let Some(cache) = cache_arc {
                         let mut cache = cache.lock().await;
-                        cache.return_statement(sql);
-                        cache.mark_cursor_closed(sql);
+                        let should_close_cursor =
+                            if statement.statement_type() == StatementType::Query {
+                                !query_result.has_more_rows
+                            } else {
+                                true
+                            };
+
+                        if from_cache {
+                            cache.return_statement(sql);
+                            if should_close_cursor {
+                                cache.mark_cursor_closed(sql);
+                            }
+                        } else if query_result.cursor_id > 0 && !statement.is_ddl() {
+                            let mut stmt_to_cache = statement.clone();
+                            stmt_to_cache.set_cursor_id(query_result.cursor_id);
+                            stmt_to_cache.set_executed(true);
+                            cache.put(sql.to_string(), stmt_to_cache);
+                            if should_close_cursor {
+                                cache.mark_cursor_closed(sql);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    if from_cache {
+                        let cache_arc = {
+                            let inner = self.inner.lock().await;
+                            inner.statement_cache.clone()
+                        };
+                        if let Some(cache) = cache_arc {
+                            let mut cache = cache.lock().await;
+                            cache.return_statement(sql);
+                            cache.mark_cursor_closed(sql);
+                        }
                     }
                 }
             }
@@ -1718,11 +1733,20 @@ impl Connection {
     /// ```
     #[tracing::instrument(skip(self, params), fields(sql = %sql, params.len = params.len()))]
     pub async fn query(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        // Promote oversized strings to CLOB binds
+        let (promoted_params, temp_lobs) = self.promote_params_if_needed(params).await?;
+        let params_to_use: &[Value] = if temp_lobs.is_empty() { params } else { &promoted_params };
+
         // Use initial prefetch of 1000 rows. For narrow tables this reduces
         // round-trips significantly. For wide tables, Oracle may return fewer
         // rows in the initial batch (~441 at 8KB SDU), but the auto-fetch
         // loop drains the remainder via FunCode=5 (fetch_more).
-        self.query_internal(sql, params, None, 1000, true).await
+        let result = self.query_internal(sql, params_to_use, None, 1000, true).await;
+
+        // Clean up temp LOBs
+        self.cleanup_temp_lobs(&temp_lobs).await;
+
+        result
     }
 
     /// Execute a query and return a streaming result set.
@@ -1987,7 +2011,55 @@ impl Connection {
             }
         }
 
+        // Auto-fetch small CLOB/NCLOB locators for transparent string access.
+        // Large CLOBs (>4MB) stay as locators for explicit read_clob/lob_stream.
+        if let Ok(ref mut qr) = result {
+            if let Err(e) = self.auto_fetch_small_clobs(qr).await {
+                tracing::warn!("Failed to auto-fetch CLOB content: {}", e);
+            }
+        }
+
         self.handle_result(result)
+    }
+
+    /// Auto-fetch CLOB/NCLOB locators whose size is under the threshold.
+    /// Replaces fetched locators with Value::String so get_string() works
+    /// transparently — no need for callers to manually call read_clob().
+    /// Skipped on 10g where LOB locator protocol is unreliable.
+    async fn auto_fetch_small_clobs(&self, result: &mut QueryResult) -> Result<()> {
+        // Skip on 10g (FIELD_VERSION_10_2 = 0): LOB locator reads hang.
+        {
+            let inner = self.inner.lock().await;
+            if inner.capabilities.ttc_field_version <= ccap_value::FIELD_VERSION_10_2 {
+                return Ok(());
+            }
+        }
+
+        const MAX_AUTO_FETCH: u64 = 4 * 1024 * 1024; // 4MB
+
+        for row in &mut result.rows {
+            let values = row.values_mut();
+            for value in values.iter_mut() {
+                let loc = match value {
+                    Value::Lob(LobValue::Locator(loc))
+                        if loc.is_clob() && loc.size > 0 && loc.size <= MAX_AUTO_FETCH =>
+                    {
+                        loc.clone()
+                    }
+                    _ => continue,
+                };
+                let data = self.read_lob_internal(&loc, 1, loc.size).await?;
+                let text = match data {
+                    LobData::String(s) => s,
+                    _ => String::from_utf8_lossy(
+                        data.as_bytes().unwrap_or(&bytes::Bytes::new()),
+                    )
+                    .into_owned(),
+                };
+                *value = Value::String(text);
+            }
+        }
+        Ok(())
     }
 
     /// Execute DML (INSERT, UPDATE, DELETE) and return rows affected
@@ -2197,10 +2269,69 @@ impl Connection {
         ProtocolParser.parse_plsql_response(payload, &caps, params)
     }
 
-    /// Execute a batch of DML statements with multiple rows of bind values
+    /// Execute a batch INSERT/UPDATE/DELETE with multiple rows in one round-trip.
     ///
-    /// This method efficiently executes the same SQL statement multiple times
-    /// with different bind values (executemany pattern).
+    /// Convenience wrapper: for advanced control (batch errors, DML row counts),
+    /// use [`execute_batch_with_options`](Self::execute_batch_with_options) or the
+    /// [`BatchBuilder`](crate::batch::BatchBuilder) API.
+    ///
+    /// Single-row batches fall back to [`execute`](Self::execute) automatically.
+    ///
+    /// # Arguments
+    /// * `sql` - SQL with bind placeholders (`:1`, `:2`, ...)
+    /// * `rows` - Each inner `Vec<Value>` is one row of bind values
+    pub async fn execute_batch(
+        &self,
+        sql: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<BatchResult> {
+        if rows.is_empty() {
+            return Ok(BatchResult::new());
+        }
+
+        // Single-row fallback: delegate to execute() (no batch overhead)
+        if rows.len() == 1 {
+            let result = self.execute(sql, &rows[0]).await?;
+            return Ok(BatchResult {
+                total_rows_affected: result.rows_affected as u64,
+                row_counts: Some(vec![result.rows_affected as u64]),
+                success_count: 1,
+                failure_count: 0,
+                errors: Vec::new(),
+            });
+        }
+
+        // CLOB auto-promotion: check each row for oversized strings
+        let mut promoted_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        let mut all_temp_lobs: Vec<LobLocator> = Vec::new();
+
+        for row in rows {
+            let (promoted_row, temp_lobs) = self.promote_params_if_needed(row).await?;
+            if !temp_lobs.is_empty() {
+                all_temp_lobs.extend(temp_lobs);
+            }
+            promoted_rows.push(promoted_row);
+        }
+
+        // Build batch with (possibly promoted) rows
+        let mut batch = BatchBinds::new(sql);
+        for row in &promoted_rows {
+            batch.add_row(row.clone());
+        }
+        batch.validate()?;
+
+        let result = self.execute_batch_impl(&batch).await;
+
+        // Clean up temp LOBs
+        self.cleanup_temp_lobs(&all_temp_lobs).await;
+
+        result
+    }
+
+    /// Execute a batch of DML statements with multiple rows of bind values.
+    ///
+    /// This is the full-featured batch API. For simple cases, use
+    /// [`execute_batch`](Self::execute_batch) instead.
     ///
     /// # Arguments
     ///
@@ -2221,7 +2352,7 @@ impl Connection {
     /// println!("Total rows affected: {}", result.total_rows_affected);
     /// ```
     #[tracing::instrument(skip(self, batch), fields(sql = %batch.sql(), rows = batch.row_count()))]
-    pub async fn execute_batch(&self, batch: &BatchBinds) -> Result<BatchResult> {
+    pub async fn execute_batch_impl(&self, batch: &BatchBinds) -> Result<BatchResult> {
         self.ensure_ready().await?;
 
         // Validate the batch
@@ -3967,6 +4098,108 @@ impl Connection {
         );
 
         Ok(locator)
+    }
+
+    /// Free a temporary LOB created with `create_temp_lob`.
+    ///
+    /// Temporary LOBs are automatically freed when the session ends, but
+    /// explicit cleanup is recommended for long-lived connections.
+    pub async fn free_temp_lob(&self, locator: &LobLocator) -> Result<()> {
+        use crate::buffer::ReadBuffer;
+
+        self.ensure_ready().await?;
+
+        let mut inner = self.inner.lock().await;
+        let large_sdu = inner.large_sdu;
+
+        let mut lob_msg = LobOpMessage::new_free_temp(locator);
+        let seq_num = inner.next_sequence_number();
+        lob_msg.set_sequence_number(seq_num);
+
+        let request = lob_msg.build_request(&inner.capabilities, large_sdu)?;
+        inner.send(&request).await?;
+
+        let response = inner.receive().await?;
+        if response.len() <= PACKET_HEADER_SIZE {
+            return Err(Error::Protocol("Empty FREE_TEMP LOB response".to_string()));
+        }
+
+        let packet_type = response[4];
+        if packet_type == PacketType::Marker as u8 {
+            let error_response = inner.handle_marker_reset().await?;
+            let payload = error_response.slice(PACKET_HEADER_SIZE..);
+            let mut buf = ReadBuffer::new(payload);
+            buf.skip(2)?;
+            return ProtocolParser.parse_lob_error(&mut buf);
+        }
+
+        let payload = response.slice(PACKET_HEADER_SIZE..);
+        let mut buf = ReadBuffer::new(payload);
+        buf.skip(2)?;
+
+        while buf.remaining() > 0 {
+            let msg_type = buf.read_u8()?;
+            match msg_type {
+                x if x == MessageType::Error as u8 => {
+                    if let Ok((code, msg, _)) = ProtocolParser.parse_error_info(&mut buf) {
+                        if code != 0 {
+                            let message =
+                                msg.unwrap_or_else(|| "FREE_TEMP LOB error".to_string());
+                            return Err(Error::OracleError { code, message });
+                        }
+                    }
+                }
+                x if x == MessageType::EndOfResponse as u8 => break,
+                _ => continue,
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check parameters and promote oversized strings to temporary CLOB binds.
+    /// Returns promoted params and a list of temp LOBs to free after execution.
+    async fn promote_params_if_needed(
+        &self,
+        params: &[Value],
+    ) -> Result<(Vec<Value>, Vec<LobLocator>)> {
+        let mut needs_promotion = false;
+        for value in params {
+            if let Value::String(s) = value {
+                if s.len() > MAX_VARCHAR_SQL {
+                    needs_promotion = true;
+                    break;
+                }
+            }
+        }
+        if !needs_promotion {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let mut promoted = Vec::with_capacity(params.len());
+        let mut temp_lobs = Vec::new();
+        for value in params {
+            if let Value::String(s) = value {
+                if s.len() > MAX_VARCHAR_SQL {
+                    let lob = self.create_temp_lob(OracleType::Clob).await?;
+                    self.write_clob(&lob, 1, s).await?;
+                    temp_lobs.push(lob.clone());
+                    promoted.push(Value::Lob(LobValue::Locator(lob)));
+                } else {
+                    promoted.push(value.clone());
+                }
+            } else {
+                promoted.push(value.clone());
+            }
+        }
+        Ok((promoted, temp_lobs))
+    }
+
+    /// Free a list of temporary LOBs, ignoring errors.
+    async fn cleanup_temp_lobs(&self, lobs: &[LobLocator]) {
+        for lob in lobs {
+            let _ = self.free_temp_lob(lob).await;
+        }
     }
 
     // ==================== BFILE Operations ====================

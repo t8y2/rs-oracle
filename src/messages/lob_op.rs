@@ -222,6 +222,23 @@ impl<'a> LobOpMessage<'a> {
         }
     }
 
+    /// Create a new FREE_TEMP LOB message
+    pub fn new_free_temp(locator: &'a LobLocator) -> Self {
+        Self {
+            locator: Some(locator),
+            owned_locator: None,
+            operation: lob_op::FREE_TEMP,
+            source_offset: 0,
+            dest_offset: 0,
+            amount: 0,
+            dest_length: 0,
+            send_amount: false,
+            write_data: None,
+            sequence_number: 0,
+            oracle_type: None,
+        }
+    }
+
     /// Get the owned locator bytes (for CREATE_TEMP operations)
     pub fn take_owned_locator(&mut self) -> Option<Vec<u8>> {
         self.owned_locator.take()

@@ -757,6 +757,10 @@ pub const MAX_LONG_LENGTH: u32 = 0x7FFFFFFF;
 /// Maximum length for UROWID
 pub const MAX_UROWID_LENGTH: u32 = 5267;
 
+/// Maximum VARCHAR2 size in SQL context (not PL/SQL).
+/// Strings exceeding this must use CLOB binding for CLOB target columns.
+pub const MAX_VARCHAR_SQL: usize = 4000;
+
 /// Bind indicator flags
 #[allow(missing_docs)]
 pub mod bind_flags {

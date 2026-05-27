@@ -307,7 +307,12 @@ impl std::fmt::Display for Value {
             Value::Lob(lob) => match lob {
                 LobValue::Null => write!(f, "NULL"),
                 LobValue::Empty => write!(f, "<empty LOB>"),
-                LobValue::Inline(data) => write!(f, "<LOB: {} bytes inline>", data.len()),
+                LobValue::Inline(data) => {
+                    match std::str::from_utf8(data) {
+                        Ok(s) => write!(f, "{}", s),
+                        Err(_) => write!(f, "<LOB: {} bytes inline>", data.len()),
+                    }
+                }
                 LobValue::Locator(loc) => {
                     write!(f, "<LOB: {} bytes, locator>", loc.size())
                 }
@@ -428,6 +433,11 @@ impl Row {
     /// Consume the row and return the values
     pub fn into_values(self) -> Vec<Value> {
         self.values
+    }
+
+    /// Get mutable reference to values (for internal LOB auto-fetch)
+    pub(crate) fn values_mut(&mut self) -> &mut Vec<Value> {
+        &mut self.values
     }
 
     /// Try to get a string value by index

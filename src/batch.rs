@@ -6,18 +6,27 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use rust_oracle::{Connection, BatchBuilder};
+//! use rust_oracle::{Connection, BatchBuilder, Value};
 //!
 //! let conn = Connection::connect("localhost:1521/ORCLPDB1", "user", "pass").await?;
 //!
-//! // Create a batch for inserting multiple rows
+//! // Simple batch with convenience API
+//! let rows = vec![
+//!     vec![Value::Integer(1), Value::String("Alice".to_string())],
+//!     vec![Value::Integer(2), Value::String("Bob".to_string())],
+//!     vec![Value::Integer(3), Value::String("Charlie".to_string())],
+//! ];
+//! let result = conn.execute_batch("INSERT INTO users (id, name) VALUES (:1, :2)", &rows).await?;
+//! println!("Total rows affected: {}", result.total_rows_affected);
+//!
+//! // Advanced: use BatchBuilder for row counts, batch errors, etc.
 //! let batch = BatchBuilder::new("INSERT INTO users (id, name) VALUES (:1, :2)")
 //!     .add_row(vec![Value::Integer(1), Value::String("Alice".to_string())])
 //!     .add_row(vec![Value::Integer(2), Value::String("Bob".to_string())])
-//!     .add_row(vec![Value::Integer(3), Value::String("Charlie".to_string())])
+//!     .with_row_counts()
 //!     .build();
 //!
-//! let result = conn.execute_batch(&batch).await?;
+//! let result = conn.execute_batch_impl(&batch).await?;
 //! println!("Rows affected per statement: {:?}", result.row_counts);
 //! ```
 
