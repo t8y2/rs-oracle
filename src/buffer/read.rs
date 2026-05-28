@@ -379,13 +379,22 @@ impl ReadBuffer {
         Ok(len & 0x7F) // Mask off high bit (sign indicator)
     }
 
-    /// Read a TNS length-prefixed byte sequence
+    /// Read a TNS length-prefixed byte sequence (big CLR chunks).
+    ///
+    /// Returns None if the length indicator is NULL_INDICATOR (255).
+    /// For data > 252 bytes, uses chunked decoding with ub4 chunk lengths.
+    pub fn read_bytes_with_length(&mut self) -> Result<Option<Vec<u8>>> {
+        self.read_bytes_with_length_ext(true)
+    }
+
+    /// Read a TNS length-prefixed byte sequence with configurable chunk format.
     ///
     /// Returns None if the length indicator is NULL_INDICATOR (255).
     /// For data > 252 bytes, uses chunked decoding:
     /// - Read LONG_INDICATOR (254)
-    /// - Read chunks: ub4(chunk_len) + raw bytes, until chunk_len is 0
-    pub fn read_bytes_with_length(&mut self) -> Result<Option<Vec<u8>>> {
+    /// - If `big_clr` (12c+): read chunks with ub4(chunk_len) until ub4(0)
+    /// - If `!big_clr` (11g): read chunks with u8(chunk_len) until u8(0)
+    pub fn read_bytes_with_length_ext(&mut self, big_clr: bool) -> Result<Option<Vec<u8>>> {
         let len = self.read_u8()?;
 
         if len == length::NULL_INDICATOR {
@@ -396,7 +405,11 @@ impl ReadBuffer {
             // Chunked format: read chunks until we get a 0-length chunk
             let mut result = Vec::new();
             loop {
-                let chunk_len = self.read_ub4()? as usize;
+                let chunk_len = if big_clr {
+                    self.read_ub4()? as usize
+                } else {
+                    self.read_u8()? as usize
+                };
                 if chunk_len == 0 {
                     break;
                 }

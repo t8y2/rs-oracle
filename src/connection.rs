@@ -4214,15 +4214,21 @@ impl Connection {
         params: &[Value],
         max_varchar: usize,
     ) -> Result<(Vec<Value>, Vec<LobLocator>)> {
-        // CLOB auto-promotion via CREATE_TEMP LOB does not work on 10g (FIELD_VERSION_10_2).
-        // 10g's LOB operation protocol is fundamentally incompatible — CREATE_TEMP LOB
-        // and LOB writes both kill the connection.
+        // Oracle 10g (FIELD_VERSION_10_2) has two VARCHAR bind limits:
+        // 1. >252 bytes: bind encoding with LONG_INDICATOR is rejected by 10g
+        // 2. >max_varchar (4000): CLOB auto-promotion doesn't work on 10g
         {
             let inner = self.inner.lock().await;
             if inner.capabilities.ttc_field_version <= crate::constants::ccap_value::FIELD_VERSION_10_2 {
-                // Check if any param actually needs promotion
                 for value in params {
                     if let Value::String(s) = value {
+                        if s.len() > 252 {
+                            return Err(Error::Protocol(
+                                "Oracle 10g does not support VARCHAR bind values larger than 252 bytes. \
+                                 For larger values, use a CLOB column and bind via DBMS_LOB procedures. \
+                                 Alternatively, split the value into multiple smaller binds.".into()
+                            ));
+                        }
                         if s.len() > max_varchar {
                             return Err(Error::Protocol(
                                 "CLOB auto-promotion is not supported on Oracle 10g. \

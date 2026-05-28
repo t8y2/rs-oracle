@@ -875,7 +875,8 @@ impl ProtocolParser {
 
         // Read the value based on the column type
         // First, check if it's NULL
-        let data = buf.read_bytes_with_length()?;
+        // Use big_clr from capabilities: 12c+ uses ub4 chunk lengths, 11g uses u8
+        let data = buf.read_bytes_with_length_ext(caps.use_big_clr_chunks)?;
 
         match data {
             None => Ok(Value::Null),
